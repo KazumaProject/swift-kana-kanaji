@@ -1,0 +1,78 @@
+name: Release dictionaries
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: "Release tag to create or update, for example v0.0.4"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Swift
+        uses: swift-actions/setup-swift@v2
+        with:
+          swift-version: "6.0"
+
+      - name: Show Swift version
+        run: swift --version
+
+      - name: Test
+        run: swift test
+
+      - name: Build CLI
+        run: swift build -c release
+
+      - name: Download Mozc dictionaries
+        run: |
+          .build/release/kana-kanji download --output mozc_fetch --overwrite
+
+      - name: Build release artifacts
+        run: |
+          mkdir -p dist
+          .build/release/kana-kanji build-dictionary --source mozc_fetch --output dist
+
+      - name: Verify artifacts
+        run: |
+          ls -lah dist
+          test -f dist/yomi_termid.louds
+          test -f dist/tango.louds
+          test -f dist/token_array.bin
+          test -f dist/pos_table.bin
+          test -f dist/connection_single_column.bin
+
+      - name: Smoke test conversion
+        run: |
+          .build/release/kana-kanji \
+            --artifacts-dir dist \
+            --connection dist/connection_single_column.bin \
+            --connection-binary \
+            --query きょうのてんき \
+            --limit 1 | tee smoke.txt
+          grep -q "今日の天気" smoke.txt
+
+      - name: Create GitHub Release and upload artifacts
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ github.event.inputs.tag_name || github.ref_name }}
+          tag_name: ${{ github.event.inputs.tag_name || github.ref_name }}
+          fail_on_unmatched_files: true
+          files: |
+            dist/yomi_termid.louds
+            dist/tango.louds
+            dist/token_array.bin
+            dist/pos_table.bin
+            dist/connection_single_column.bin

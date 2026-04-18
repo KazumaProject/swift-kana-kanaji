@@ -1,0 +1,27 @@
+# macOS
+.DS_Store
+
+# Swift Package Manager
+.build/
+.swiftpm/
+
+# Xcode / editor state
+DerivedData/
+*.xcuserstate
+*.xcworkspace/xcuserdata/
+*.xcodeproj/xcuserdata/
+
+# Generated Mozc source dictionaries
+mozc_fetch/
+
+# Generated release artifacts
+artifacts/
+dist/
+
+# Local binaries and logs
+hello
+*.log
+
+# Temporary files
+*.tmp
+*.swp
