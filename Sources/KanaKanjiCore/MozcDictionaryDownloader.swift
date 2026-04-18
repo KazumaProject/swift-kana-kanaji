@@ -1,4 +1,7 @@
 import Foundation
+#if canImport(FoundationNetworking)
+import FoundationNetworking
+#endif
 
 public enum MozcDictionaryDownloader {
     public static let defaultBaseURL = URL(
