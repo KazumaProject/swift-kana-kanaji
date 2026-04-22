@@ -24,9 +24,45 @@ struct BuildDictionaryOptions {
     var outputDirectory: URL?
 }
 
+/// Unified kind selector for `build-dictionary --kind <kind>`.
+///
+/// Extends `DictionaryKind` with the separate `english` family, which uses its
+/// own builder and artifact format rather than the Mozc-family pipeline.
+enum CLIDictionaryKind {
+    case mozc(DictionaryKind)
+    case english
+
+    init?(rawValue: String) {
+        if rawValue == "english" {
+            self = .english
+            return
+        }
+        if let k = DictionaryKind(rawValue: rawValue) {
+            self = .mozc(k)
+            return
+        }
+        return nil
+    }
+
+    var rawValue: String {
+        switch self {
+        case .mozc(let k): return k.rawValue
+        case .english:     return "english"
+        }
+    }
+
+    var description: String {
+        switch self {
+        case .mozc(let k): return k.description
+        case .english:
+            return "English n-gram prediction dictionary (separate builder/artifact family)"
+        }
+    }
+}
+
 /// Options for `build-dictionary --kind <kind> --source <dir> --output <dir>`
 struct BuildKindOptions {
-    var kind: DictionaryKind?
+    var kind: CLIDictionaryKind?
     var sourceDirectory: URL?
     var outputDirectory: URL?
 }
@@ -41,6 +77,9 @@ struct BuildAllOptions {
 // MARK: - Usage
 
 func printUsage() {
+    let mozcKindList = DictionaryKind.allCases
+        .map { "  \($0.rawValue.padding(toLength: 20, withPad: " ", startingAt: 0)) \($0.description)" }
+        .joined(separator: "\n")
     print("""
     Usage:
       kana-kanji download --output <dir> [--overwrite]
@@ -48,13 +87,15 @@ func printUsage() {
       # Build main Mozc dictionary (backward-compatible flat output):
       kana-kanji build-dictionary --source <mozc_fetch_dir> --output <artifacts_dir>
 
-      # Build a single supplemental dictionary into <output>/<kind>/:
+      # Build a single supplemental/English dictionary into <output>/<kind>/:
       kana-kanji build-dictionary --kind <kind> --source <source_dir> --output <root_output_dir>
 
       # Build all dictionaries into <output>/<kind>/ subdirectories:
+      #   Mozc-family: skips missing TSVs by default.
+      #   English:     built when 1-grams_score_cost_pos_combined_with_ner.zip is present.
       kana-kanji build-all-dictionaries --source <source_dir> --output <root_output_dir>
 
-      # List supported dictionary kinds:
+      # List supported dictionary kinds (Mozc-family + english):
       kana-kanji list-dictionary-kinds
 
       # Run conversion (artifact mode):
@@ -65,14 +106,19 @@ func printUsage() {
       kana-kanji --dictionary-dir <dir> [--connection <path>] [--connection-binary]
                  [--query <hiragana>] [--limit N] [--beam N]
 
-    Supported dictionary kinds:
-    \(DictionaryKind.allCases.map { "  \($0.rawValue.padding(toLength: 20, withPad: " ", startingAt: 0)) \($0.description)" }.joined(separator: "\n"))
+    Mozc-family dictionary kinds:
+    \(mozcKindList)
+
+      english              English n-gram prediction dictionary
+                           Source: \(EnglishDictionarySourceParser.sourceFileName)
+                           Artifacts: reading.dat, word.dat, token.dat
 
     Examples:
       kana-kanji download --output ./mozc_fetch
       kana-kanji build-dictionary --source ./mozc_fetch --output ./artifacts
       kana-kanji build-all-dictionaries --source ./mozc_fetch --output ./dict_root
       kana-kanji build-dictionary --kind emoji --source ./mozc_fetch --output ./dict_root
+      kana-kanji build-dictionary --kind english --source ./src_dir --output ./dict_root
       kana-kanji --artifacts-dir ./artifacts \\
                  --connection ./artifacts/connection_single_column.bin \\
                  --connection-binary --query きょうのてんき
@@ -169,7 +215,7 @@ func parseBuildDictionaryArguments(_ arguments: [String]) throws -> (BuildDictio
             kindOptions.outputDirectory = path
         case "--kind", "-k":
             let rawKind = try requireValue(after: arg)
-            guard let kind = DictionaryKind(rawValue: rawKind) else {
+            guard let kind = CLIDictionaryKind(rawValue: rawKind) else {
                 throw NSError(domain: "KanaKanjiCLI", code: 2, userInfo: [
                     NSLocalizedDescriptionKey: "Unknown dictionary kind '\(rawKind)'. Run 'list-dictionary-kinds' to see supported kinds."
                 ])
@@ -270,6 +316,7 @@ do {
     // ── list-dictionary-kinds ─────────────────────────────────────────────────
     if command == "list-dictionary-kinds" {
         print("Supported dictionary kinds:\n")
+        print("── Mozc-family (supplemental) ──")
         for kind in DictionaryKind.allCases {
             let connectionNote = kind.requiresConnectionMatrix ? " (requires connection matrix)" : ""
             let sourceFile = kind.defaultSourceFileName ?? "<dictionary00.txt … dictionary09.txt>"
@@ -279,6 +326,12 @@ do {
             print("    artifacts   : \(kind.artifactFileNames.joined(separator: ", "))")
             print()
         }
+        print("── English (separate family) ──")
+        print("  english")
+        print("    description : English n-gram prediction dictionary (separate builder/artifact family)")
+        print("    source file : \(EnglishDictionarySourceParser.sourceFileName)")
+        print("    artifacts   : \(EnglishDictionaryBuilder.artifactFileNames.joined(separator: ", "))")
+        print()
         exit(0)
     }
 
@@ -311,6 +364,7 @@ do {
             exit(2)
         }
 
+        // ── Mozc-family kinds ──
         let built = try DictionaryArtifactBuilder.buildAll(
             from: sourceDirectory,
             to: outputDirectory,
@@ -326,6 +380,28 @@ do {
                 }
             }
         }
+
+        // ── English family (separate builder; skipped when source zip is absent) ──
+        let englishZip = sourceDirectory
+            .appendingPathComponent(EnglishDictionarySourceParser.sourceFileName)
+        if FileManager.default.fileExists(atPath: englishZip.path) {
+            let englishOutputDir = outputDirectory
+                .appendingPathComponent(EnglishDictionaryBuilder.outputDirectoryName)
+            do {
+                try EnglishDictionaryBuilder.build(from: englishZip, to: englishOutputDir)
+                for fileName in EnglishDictionaryBuilder.artifactFileNames {
+                    let fileURL = englishOutputDir.appendingPathComponent(fileName)
+                    if FileManager.default.fileExists(atPath: fileURL.path) {
+                        print(fileURL.path)
+                    }
+                }
+            } catch {
+                stderr("Warning: english dictionary build failed: \(error.localizedDescription)")
+            }
+        } else {
+            stderr("Note: \(EnglishDictionarySourceParser.sourceFileName) not found in source — english skipped.")
+        }
+
         exit(0)
     }
 
@@ -343,13 +419,34 @@ do {
                 exit(2)
             }
 
-            let paths = try DictionaryArtifactBuilder.build(
-                kind: kind,
-                from: sourceDirectory,
-                to: outputDirectory
-            )
-            for url in paths where FileManager.default.fileExists(atPath: url.path) {
-                print(url.path)
+            switch kind {
+            case .english:
+                // English is a separate family: source is the fixed-name zip.
+                let zipURL = sourceDirectory
+                    .appendingPathComponent(EnglishDictionarySourceParser.sourceFileName)
+                guard FileManager.default.fileExists(atPath: zipURL.path) else {
+                    stderr("Error: English source zip not found at \(zipURL.path)")
+                    exit(1)
+                }
+                let englishOutputDir = outputDirectory
+                    .appendingPathComponent(EnglishDictionaryBuilder.outputDirectoryName)
+                try EnglishDictionaryBuilder.build(from: zipURL, to: englishOutputDir)
+                for fileName in EnglishDictionaryBuilder.artifactFileNames {
+                    let fileURL = englishOutputDir.appendingPathComponent(fileName)
+                    if FileManager.default.fileExists(atPath: fileURL.path) {
+                        print(fileURL.path)
+                    }
+                }
+
+            case .mozc(let mozcKind):
+                let paths = try DictionaryArtifactBuilder.build(
+                    kind: mozcKind,
+                    from: sourceDirectory,
+                    to: outputDirectory
+                )
+                for url in paths where FileManager.default.fileExists(atPath: url.path) {
+                    print(url.path)
+                }
             }
         } else {
             // Backward-compatible path: flat output for main dictionary
