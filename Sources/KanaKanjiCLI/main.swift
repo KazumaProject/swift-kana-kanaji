@@ -71,8 +71,8 @@ func printUsage() {
     Examples:
       kana-kanji download --output ./mozc_fetch
       kana-kanji build-dictionary --source ./mozc_fetch --output ./artifacts
-      kana-kanji build-all-dictionaries --source ./bin_dir --output ./dict_root
-      kana-kanji build-dictionary --kind emoji --source ./bin_dir --output ./dict_root
+      kana-kanji build-all-dictionaries --source ./mozc_fetch --output ./dict_root
+      kana-kanji build-dictionary --kind emoji --source ./mozc_fetch --output ./dict_root
       kana-kanji --artifacts-dir ./artifacts \\
                  --connection ./artifacts/connection_single_column.bin \\
                  --connection-binary --query きょうのてんき

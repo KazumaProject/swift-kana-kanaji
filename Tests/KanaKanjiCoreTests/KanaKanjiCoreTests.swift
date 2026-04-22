@@ -883,6 +883,12 @@ final class DictionaryArtifactBuilderTests: XCTestCase {
         // main will fail (no dictionary*.txt), others missing TSVs are skipped
         XCTAssertTrue(built.contains(.emoji))
         XCTAssertFalse(built.contains(.main))
+        XCTAssertFalse(FileManager.default.fileExists(
+            atPath: outputRoot.appendingPathComponent(DictionaryKind.main.outputDirectoryName).path
+        ))
+        XCTAssertFalse(FileManager.default.fileExists(
+            atPath: outputRoot.appendingPathComponent(DictionaryKind.singleKanji.outputDirectoryName).path
+        ))
     }
 
     func testBuildAllBuildsMultipleKinds() throws {

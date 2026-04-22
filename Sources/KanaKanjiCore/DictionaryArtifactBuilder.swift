@@ -49,8 +49,8 @@ public enum DictionaryArtifactBuilder {
     ///     `reading_correction.tsv`, `kotowaza.tsv`, `single_kanji.tsv`).
     ///   - outputDirectory: Root directory that receives a subdirectory for each
     ///     kind (e.g. `<output>/emoji/`).
-    ///   - skipMissingSupplemental: When `true` (default), supplemental kinds
-    ///     whose source TSV is absent are silently skipped.  When `false`, a
+    ///   - skipMissingSupplemental: When `true` (default), dictionary kinds
+    ///     whose source files are absent are skipped.  When `false`, a
     ///     ``KanaKanjiError/dictionaryNotFound(_:)`` is thrown instead.
     /// - Returns: The ``DictionaryKind`` values that were actually built.
     @discardableResult
@@ -64,8 +64,8 @@ public enum DictionaryArtifactBuilder {
             do {
                 try build(kind: kind, from: sourceDirectory, to: outputDirectory)
                 built.append(kind)
-            } catch KanaKanjiError.dictionaryNotFound(_) where skipMissingSupplemental && kind != .main {
-                // Source TSV for this supplemental kind is absent — skip silently.
+            } catch KanaKanjiError.dictionaryNotFound(_) where skipMissingSupplemental {
+                // Source files for this kind are absent — skip silently.
                 continue
             }
         }
@@ -94,7 +94,6 @@ public enum DictionaryArtifactBuilder {
         to outputDirectory: URL
     ) throws -> [URL] {
         let kindOutputDirectory = outputDirectory.appendingPathComponent(kind.outputDirectoryName)
-        try FileManager.default.createDirectory(at: kindOutputDirectory, withIntermediateDirectories: true)
 
         switch kind {
         case .main:

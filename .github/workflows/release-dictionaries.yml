@@ -45,27 +45,53 @@ jobs:
           .build/release/kana-kanji download --output mozc_fetch --overwrite
 
       - name: Copy supplemental TSV files (if present in repo)
+        shell: bash
         run: |
-          # Resources/bin/ に補助辞書 TSV を置いておけば自動的に取り込まれる。
-          # ファイルが存在しない場合は静かにスキップする。
-          if [ -d Resources/bin ]; then
-            cp --no-clobber Resources/bin/*.tsv mozc_fetch/ 2>/dev/null || true
-            echo "Copied supplemental TSVs from Resources/bin/"
-          else
-            echo "Resources/bin/ not found — only main dictionary will be built."
+          shopt -s nullglob
+          supplemental=(Resources/bin/*.tsv)
+          if [ ${#supplemental[@]} -eq 0 ]; then
+            echo "No supplemental TSVs found in Resources/bin; only main is required."
+            exit 0
           fi
+
+          for file in "${supplemental[@]}"; do
+            cp "${file}" mozc_fetch/
+            echo "Copied $(basename "${file}")"
+          done
+
+      - name: Show dictionary sources
+        shell: bash
+        run: |
+          echo "Main source files:"
+          ls mozc_fetch/dictionary*.txt
+          echo
+          echo "Supplemental source files:"
+          for name in emoji_data.tsv emoticon.tsv symbol.tsv reading_correction.tsv single_kanji.tsv kotowaza.tsv; do
+            if [ -f "mozc_fetch/${name}" ]; then
+              echo "  present: ${name}"
+            else
+              echo "  missing: ${name} (will be skipped)"
+            fi
+          done
 
       # ── 全辞書のビルド ──────────────────────────────────────────────────────
       # dist/<kind>/ にそれぞれの artifact が書き出される。
       # TSV が存在しない補助辞書は自動的にスキップされる (--no-skip-missing 指定なし)。
       - name: Build all dictionary artifacts
+        shell: bash
         run: |
           mkdir -p dist
           .build/release/kana-kanji build-all-dictionaries \
             --source mozc_fetch \
             --output dist
-          echo "Built dictionary kinds:"
-          ls dist/
+          echo "Dictionary build result:"
+          for kind in main emoji emoticon symbol reading_correction single_kanji kotowaza; do
+            if [ -d "dist/${kind}" ]; then
+              echo "  built: ${kind}"
+            else
+              echo "  skipped: ${kind}"
+            fi
+          done
 
       # ── メイン辞書の検証 ────────────────────────────────────────────────────
       - name: Verify main artifacts
@@ -90,6 +116,7 @@ jobs:
       # ── 補助辞書のスモークテスト ────────────────────────────────────────────
       # 各種類のディレクトリが存在すれば基本的なファイル存在確認を行う。
       - name: Verify supplemental artifacts (if built)
+        shell: bash
         run: |
           for kind in single_kanji emoji emoticon symbol reading_correction kotowaza; do
             dir="dist/${kind}"
@@ -119,6 +146,7 @@ jobs:
           cp dist/main/connection_single_column.bin dist/connection_single_column.bin
 
       - name: Package each dictionary kind as zip
+        shell: bash
         run: |
           cd dist
           for kind_dir in */; do
