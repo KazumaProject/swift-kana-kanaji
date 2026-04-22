@@ -12,6 +12,15 @@ public struct MozcDictionary: Sendable {
     struct PrefixMatch {
         let length: Int
         let entries: [DictionaryEntry]
+        /// omission-aware search 等で生じた置換コスト (単位: replaceCount)。
+        /// 通常の common prefix や predictive の結果では 0。
+        let penalty: Int
+
+        init(length: Int, entries: [DictionaryEntry], penalty: Int = 0) {
+            self.length = length
+            self.entries = entries
+            self.penalty = penalty
+        }
     }
 
     private enum Storage: Sendable {
@@ -125,19 +134,115 @@ public struct MozcDictionary: Sendable {
         return entries
     }
 
-    func prefixMatches(in characters: [Character], from start: Int) -> [PrefixMatch] {
+    /// 指定された位置から始まる yomi 候補を収集する。
+    ///
+    /// - Parameters:
+    ///   - characters: 入力全体の文字配列。
+    ///   - start: `characters` における検索開始位置。
+    ///   - mode: yomi 候補の収集モード。省略時は旧来の common prefix のみ。
+    ///   - predictivePrefixLength: predictive search で取り出す接頭辞長 (文字数)。
+    /// - Returns: yomi ごとに重複排除済みの `PrefixMatch` のリスト。
+    ///   `penalty` は omission 由来の `replaceCount` (common prefix / predictive は 0)。
+    func prefixMatches(
+        in characters: [Character],
+        from start: Int,
+        mode: YomiSearchMode = .commonPrefixOnly,
+        predictivePrefixLength: Int = 1
+    ) -> [PrefixMatch] {
         switch storage {
         case let .memory(trie, entryGroups):
-            return trie.commonPrefixSearch(in: characters, from: start).compactMap {
-                guard $0.value >= 0, $0.value < entryGroups.count else {
-                    return nil
-                }
-                return PrefixMatch(length: $0.length, entries: entryGroups[$0.value])
-            }
+            return memoryMatches(
+                trie: trie,
+                entryGroups: entryGroups,
+                characters: characters,
+                start: start,
+                mode: mode,
+                predictivePrefixLength: predictivePrefixLength
+            )
         case let .artifacts(artifacts):
             let suffix = String(characters[start...])
-            return artifacts.prefixMatches(suffix)
+            return artifacts.prefixMatches(
+                suffix,
+                mode: mode,
+                predictivePrefixLength: predictivePrefixLength
+            )
         }
+    }
+
+    private func memoryMatches(
+        trie: LOUDSTrie<Int>,
+        entryGroups: [[DictionaryEntry]],
+        characters: [Character],
+        start: Int,
+        mode: YomiSearchMode,
+        predictivePrefixLength: Int
+    ) -> [PrefixMatch] {
+        guard start < characters.count else {
+            return []
+        }
+
+        let remaining = characters.count - start
+
+        // value (= entry group index) -> (length, penalty)
+        var collected: [Int: (length: Int, penalty: Int)] = [:]
+        collected.reserveCapacity(32)
+
+        // (A) common prefix search は常に実施
+        for match in trie.commonPrefixSearch(in: characters, from: start) {
+            if let existing = collected[match.value] {
+                if 0 < existing.penalty {
+                    collected[match.value] = (match.length, 0)
+                }
+            } else {
+                collected[match.value] = (match.length, 0)
+            }
+        }
+
+        // (B) predictive search (YomiSearchMode 設定時のみ)
+        if mode.includesPredictive, remaining > 0 {
+            let k = max(1, min(predictivePrefixLength, remaining))
+            let prefixCharacters = characters[start..<(start + k)]
+            let prefix = String(prefixCharacters)
+            for result in trie.predictiveSearch(prefix: prefix) {
+                let length = result.key.count
+                guard length <= remaining else {
+                    continue
+                }
+                if collected[result.value] == nil {
+                    collected[result.value] = (length, 0)
+                }
+            }
+        }
+
+        // (C) omission-aware search (YomiSearchMode 設定時のみ)
+        if mode.includesOmission {
+            for match in trie.commonPrefixSearchWithOmission(in: characters, from: start) {
+                guard match.length <= remaining else {
+                    continue
+                }
+                if let existing = collected[match.value] {
+                    if match.replaceCount < existing.penalty {
+                        collected[match.value] = (existing.length, match.replaceCount)
+                    }
+                } else {
+                    collected[match.value] = (match.length, match.replaceCount)
+                }
+            }
+        }
+
+        var result: [PrefixMatch] = []
+        result.reserveCapacity(collected.count)
+        for (value, tuple) in collected {
+            guard value >= 0, value < entryGroups.count else {
+                continue
+            }
+            result.append(PrefixMatch(
+                length: tuple.length,
+                entries: entryGroups[value],
+                penalty: tuple.penalty
+            ))
+        }
+        return result
     }
 
     private static func parseInt(
