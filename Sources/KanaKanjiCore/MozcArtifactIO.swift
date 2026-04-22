@@ -179,6 +179,7 @@ enum MozcArtifactIO {
                 }
             }
         }
+        postingsBits.append(false)
 
         return CompatibleTokenArray(
             posIndex: posIndex,
