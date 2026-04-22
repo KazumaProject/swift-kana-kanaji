@@ -44,20 +44,35 @@ jobs:
         run: |
           .build/release/kana-kanji download --output mozc_fetch --overwrite
 
-      - name: Copy supplemental TSV files (if present in repo)
+      # strategy: 事前配置された source ファイルを使う。
+      # Resources/bin/ に *.tsv (Mozc補助辞書) と *.zip (English辞書) を置いておくことで
+      # ビルドが実行される。どちらも省略可能 (なければそのkindをスキップ)。
+      - name: Copy supplemental source files (TSV + ZIP, if present in repo)
         shell: bash
         run: |
           shopt -s nullglob
-          supplemental=(Resources/bin/*.tsv)
-          if [ ${#supplemental[@]} -eq 0 ]; then
-            echo "No supplemental TSVs found in Resources/bin; only main is required."
-            exit 0
+
+          # TSV files (Mozc-family supplemental dictionaries)
+          tsv_files=(Resources/bin/*.tsv)
+          if [ ${#tsv_files[@]} -eq 0 ]; then
+            echo "No supplemental TSVs found in Resources/bin."
+          else
+            for file in "${tsv_files[@]}"; do
+              cp "${file}" mozc_fetch/
+              echo "Copied TSV: $(basename "${file}")"
+            done
           fi
 
-          for file in "${supplemental[@]}"; do
-            cp "${file}" mozc_fetch/
-            echo "Copied $(basename "${file}")"
-          done
+          # ZIP files (English dictionary source — fixed name)
+          zip_files=(Resources/bin/*.zip)
+          if [ ${#zip_files[@]} -eq 0 ]; then
+            echo "No ZIP files found in Resources/bin — english dictionary will be skipped."
+          else
+            for file in "${zip_files[@]}"; do
+              cp "${file}" mozc_fetch/
+              echo "Copied ZIP: $(basename "${file}")"
+            done
+          fi
 
       - name: Show dictionary sources
         shell: bash
@@ -65,7 +80,7 @@ jobs:
           echo "Main source files:"
           ls mozc_fetch/dictionary*.txt
           echo
-          echo "Supplemental source files:"
+          echo "Supplemental source files (Mozc-family TSVs):"
           for name in emoji_data.tsv emoticon.tsv symbol.tsv reading_correction.tsv single_kanji.tsv kotowaza.tsv; do
             if [ -f "mozc_fetch/${name}" ]; then
               echo "  present: ${name}"
@@ -73,10 +88,19 @@ jobs:
               echo "  missing: ${name} (will be skipped)"
             fi
           done
+          echo
+          echo "English source (separate family):"
+          eng_zip="1-grams_score_cost_pos_combined_with_ner.zip"
+          if [ -f "mozc_fetch/${eng_zip}" ]; then
+            echo "  present: ${eng_zip}"
+          else
+            echo "  missing: ${eng_zip} (english will be skipped)"
+          fi
 
       # ── 全辞書のビルド ──────────────────────────────────────────────────────
       # dist/<kind>/ にそれぞれの artifact が書き出される。
-      # TSV が存在しない補助辞書は自動的にスキップされる (--no-skip-missing 指定なし)。
+      # Mozc-family: TSV が存在しない補助辞書は自動的にスキップ (--no-skip-missing 指定なし)。
+      # English:     1-grams_score_cost_pos_combined_with_ner.zip が存在すれば build-all が自動実行。
       - name: Build all dictionary artifacts
         shell: bash
         run: |
@@ -84,8 +108,9 @@ jobs:
           .build/release/kana-kanji build-all-dictionaries \
             --source mozc_fetch \
             --output dist
+          echo ""
           echo "Dictionary build result:"
-          for kind in main emoji emoticon symbol reading_correction single_kanji kotowaza; do
+          for kind in main emoji emoticon symbol reading_correction single_kanji kotowaza english; do
             if [ -d "dist/${kind}" ]; then
               echo "  built: ${kind}"
             else
@@ -113,7 +138,7 @@ jobs:
             --limit 1 | tee smoke.txt
           grep -q "今日の天気" smoke.txt
 
-      # ── 補助辞書のスモークテスト ────────────────────────────────────────────
+      # ── 補助辞書のスモークテスト (Mozc-family) ────────────────────────────────
       # 各種類のディレクトリが存在すれば基本的なファイル存在確認を行う。
       - name: Verify supplemental artifacts (if built)
         shell: bash
@@ -130,6 +155,22 @@ jobs:
               echo "Skipped (not built): ${kind}"
             fi
           done
+
+      # ── English 辞書のスモークテスト ────────────────────────────────────────
+      # English は Mozc-family とは異なる artifact 構造 (reading.dat/word.dat/token.dat)
+      - name: Verify english artifacts (if built)
+        shell: bash
+        run: |
+          dir="dist/english"
+          if [ -d "${dir}" ]; then
+            echo "Checking english..."
+            for f in reading.dat word.dat token.dat; do
+              test -f "${dir}/${f}" || (echo "Missing: ${dir}/${f}" && exit 1)
+            done
+            echo "  OK: english"
+          else
+            echo "Skipped (not built): english"
+          fi
 
       # ── パッケージング ──────────────────────────────────────────────────────
       # 辞書種類ごとにディレクトリを zip してリリースアセットを作る。
@@ -193,3 +234,4 @@ jobs:
             symbol.zip
             reading_correction.zip
             kotowaza.zip
+            english.zip
