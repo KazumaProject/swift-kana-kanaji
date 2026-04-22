@@ -161,6 +161,134 @@ struct CompatibleLOUDS: Sendable {
         return results
     }
 
+    /// 接頭辞 `codeUnits` で始まるすべての yomi を列挙する。
+    /// C++ 版 `LOUDSReaderUtf16::predictiveSearch` の移植。
+    func predictiveSearchTermIds(_ codeUnits: [UInt16]) -> [(yomi: String, termId: Int)] {
+        var node = 0
+        var built: [UInt16] = []
+        built.reserveCapacity(codeUnits.count)
+
+        for unit in codeUnits {
+            node = traverse(node, unit)
+            if node < 0 {
+                return []
+            }
+            let idx = lbs.rank1(node)
+            guard idx >= 0, idx < labels.count else {
+                return []
+            }
+            built.append(labels[idx])
+        }
+
+        var out: [(String, Int)] = []
+        collectTerms(pos: node, built: &built, out: &out)
+        return out
+    }
+
+    private func collectTerms(
+        pos: Int,
+        built: inout [UInt16],
+        out: inout [(String, Int)]
+    ) {
+        guard pos >= 0, pos < lbs.bitCount else {
+            return
+        }
+
+        if pos < isLeaf.bitCount, isLeaf.get(pos) {
+            let nodeId = lbs.rank1(pos) - 1
+            if let termIds, nodeId >= 0, nodeId < termIds.count, termIds[nodeId] >= 0 {
+                let yomi = String(decoding: built, as: UTF16.self)
+                out.append((yomi, Int(termIds[nodeId])))
+            }
+        }
+
+        var child = firstChild(pos)
+        while child >= 0, child < lbs.bitCount, lbs.get(child) {
+            let labelIndex = lbs.rank1(child)
+            guard labelIndex >= 0, labelIndex < labels.count else {
+                break
+            }
+            built.append(labels[labelIndex])
+            collectTerms(pos: child, built: &built, out: &out)
+            built.removeLast()
+            child += 1
+        }
+    }
+
+    /// 濁点/半濁点/小書きなどの置換を許容する common prefix search。
+    /// C++ 版 `LOUDSReaderUtf16::commonPrefixSearchWithOmission` の移植。
+    /// 返り値は termId でデデュプ済みで、同じ termId に複数経路で到達した場合は
+    /// `replaceCount` の最小値を採用する。
+    func commonPrefixSearchWithOmissionTermIds(
+        _ codeUnits: [UInt16]
+    ) -> [(yomi: String, termId: Int, replaceCount: Int)] {
+        var resultByTerm: [Int: (yomi: String, replaceCount: Int)] = [:]
+        var built: [UInt16] = []
+        built.reserveCapacity(codeUnits.count)
+
+        omissionRecursive(
+            codeUnits: codeUnits,
+            strIndex: 0,
+            node: 0,
+            built: &built,
+            replaceCount: 0,
+            results: &resultByTerm
+        )
+
+        return resultByTerm.map { ($0.value.yomi, $0.key, $0.value.replaceCount) }
+    }
+
+    private func omissionRecursive(
+        codeUnits: [UInt16],
+        strIndex: Int,
+        node: Int,
+        built: inout [UInt16],
+        replaceCount: Int,
+        results: inout [Int: (yomi: String, replaceCount: Int)]
+    ) {
+        if node < 0 || node >= lbs.bitCount {
+            return
+        }
+
+        if node != 0, node < isLeaf.bitCount, isLeaf.get(node) {
+            let nodeId = lbs.rank1(node) - 1
+            if let termIds, nodeId >= 0, nodeId < termIds.count, termIds[nodeId] >= 0 {
+                let termId = Int(termIds[nodeId])
+                let yomi = String(decoding: built, as: UTF16.self)
+                if let existing = results[termId] {
+                    if replaceCount < existing.replaceCount {
+                        results[termId] = (yomi, replaceCount)
+                    }
+                } else {
+                    results[termId] = (yomi, replaceCount)
+                }
+            }
+        }
+
+        guard strIndex < codeUnits.count else {
+            return
+        }
+
+        let ch = codeUnits[strIndex]
+        for variant in KanaVariations.variations(for: ch) {
+            let next = traverse(node, variant)
+            guard next >= 0 else {
+                continue
+            }
+            let replaced = (variant != ch) ? 1 : 0
+            built.append(variant)
+            omissionRecursive(
+                codeUnits: codeUnits,
+                strIndex: strIndex + 1,
+                node: next,
+                built: &built,
+                replaceCount: replaceCount + replaced,
+                results: &results
+            )
+            built.removeLast()
+        }
+    }
+
     func getLetter(nodeIndex: Int) -> String {
         guard nodeIndex >= 0, nodeIndex < lbs.bitCount else {
             return ""
@@ -286,32 +414,101 @@ struct MozcArtifactDictionary: Sendable {
     let tokens: CompatibleTokenArray
     let posTable: CompatiblePosTable
 
-    func prefixMatches(_ input: String) -> [MozcDictionary.PrefixMatch] {
-        yomiTerm.commonPrefixSearchTermIds(Array(input.utf16)).map { hit in
-            let entries = tokens.tokens(forTermId: hit.termId).map { token -> DictionaryEntry in
-                let ids = posTable.ids(for: token.posIndex)
-                let surface: String
-                if token.nodeIndex == CompatibleTokenArray.hiraganaSentinel {
-                    surface = hit.yomi
-                } else if token.nodeIndex == CompatibleTokenArray.katakanaSentinel {
-                    surface = hiraganaToKatakana(hit.yomi)
-                } else {
-                    surface = tango.getLetter(nodeIndex: Int(token.nodeIndex))
+    /// `suffix` から始まる入力に対して、与えられた `mode` で yomi 候補を集める。
+    /// 既存呼び出しとの互換のため `mode = .commonPrefixOnly` の場合は
+    /// 旧来の common prefix のみの挙動と等価になるようデフォルト値を保っている。
+    func prefixMatches(
+        _ input: String,
+        mode: YomiSearchMode = .commonPrefixOnly,
+        predictivePrefixLength: Int = 1
+    ) -> [MozcDictionary.PrefixMatch] {
+        let codeUnits = Array(input.utf16)
+        let remaining = codeUnits.count
+
+        // termId -> (yomi, length[UTF-16], penalty)
+        var collected: [Int: (yomi: String, length: Int, penalty: Int)] = [:]
+        collected.reserveCapacity(64)
+
+        // (A) common prefix search は常に実施
+        for hit in yomiTerm.commonPrefixSearchTermIds(codeUnits) {
+            let length = hit.yomi.utf16.count
+            if let existing = collected[hit.termId] {
+                if 0 < existing.penalty {
+                    collected[hit.termId] = (hit.yomi, length, 0)
                 }
-                return DictionaryEntry(
-                    yomi: hit.yomi,
-                    leftId: ids.left,
-                    rightId: ids.right,
-                    cost: Int(token.wordCost),
-                    surface: surface
-                )
-            }.sorted {
-                if $0.cost != $1.cost {
-                    return $0.cost < $1.cost
-                }
-                return $0.surface < $1.surface
+            } else {
+                collected[hit.termId] = (hit.yomi, length, 0)
             }
-            return MozcDictionary.PrefixMatch(length: hit.yomi.count, entries: entries)
+        }
+
+        // (B) predictive search
+        if mode.includesPredictive, remaining > 0 {
+            let k = max(1, min(predictivePrefixLength, remaining))
+            let prefix = Array(codeUnits.prefix(k))
+            for hit in yomiTerm.predictiveSearchTermIds(prefix) {
+                let length = hit.yomi.utf16.count
+                guard length <= remaining else {
+                    continue
+                }
+                if collected[hit.termId] == nil {
+                    collected[hit.termId] = (hit.yomi, length, 0)
+                }
+            }
+        }
+
+        // (C) omission-aware search
+        if mode.includesOmission {
+            for hit in yomiTerm.commonPrefixSearchWithOmissionTermIds(codeUnits) {
+                let length = hit.yomi.utf16.count
+                guard length <= remaining else {
+                    continue
+                }
+                let penalty = hit.replaceCount
+                if let existing = collected[hit.termId] {
+                    if penalty < existing.penalty {
+                        collected[hit.termId] = (existing.yomi, existing.length, penalty)
+                    }
+                } else {
+                    collected[hit.termId] = (hit.yomi, length, penalty)
+                }
+            }
+        }
+
+        return collected.map { (termId, value) -> MozcDictionary.PrefixMatch in
+            let entries = buildEntries(forTermId: termId, yomi: value.yomi)
+            // length はグラフ構築時の endPosition 計算に使われるため、
+            // Character 単位に揃える (ひらがなでは UTF-16 単位数と一致する)。
+            return MozcDictionary.PrefixMatch(
+                length: value.yomi.count,
+                entries: entries,
+                penalty: value.penalty
+            )
+        }
+    }
+
+    private func buildEntries(forTermId termId: Int, yomi: String) -> [DictionaryEntry] {
+        tokens.tokens(forTermId: termId).map { token -> DictionaryEntry in
+            let ids = posTable.ids(for: token.posIndex)
+            let surface: String
+            if token.nodeIndex == CompatibleTokenArray.hiraganaSentinel {
+                surface = yomi
+            } else if token.nodeIndex == CompatibleTokenArray.katakanaSentinel {
+                surface = hiraganaToKatakana(yomi)
+            } else {
+                surface = tango.getLetter(nodeIndex: Int(token.nodeIndex))
+            }
+            return DictionaryEntry(
+                yomi: yomi,
+                leftId: ids.left,
+                rightId: ids.right,
+                cost: Int(token.wordCost),
+                surface: surface
+            )
+        }.sorted {
+            if $0.cost != $1.cost {
+                return $0.cost < $1.cost
+            }
+            return $0.surface < $1.surface
         }
     }
 

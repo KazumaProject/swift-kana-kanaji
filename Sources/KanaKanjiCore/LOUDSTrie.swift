@@ -93,9 +93,86 @@ struct LOUDSBitVector: Sendable {
     }
 }
 
+/// 濁点 / 半濁点 / 小書き文字などの「入力で省略されがちなしるし」を吸収するための
+/// 文字バリエーション表。C++ 版 `LOUDSReaderUtf16::getCharVariations` と同じ対応を持つ。
+///
+/// 非対称であることに注意: 入力 `か` に対しては `[か, が]` を返すが、
+/// 入力 `が` に対しては `[が]` しか返さない (= 入力が "lean" で辞書が "rich" のケースだけ吸収する)。
+enum KanaVariations {
+    private static let pairs: [(Character, [Character])] = [
+        ("か", ["か", "が"]),
+        ("き", ["き", "ぎ"]),
+        ("く", ["く", "ぐ"]),
+        ("け", ["け", "げ"]),
+        ("こ", ["こ", "ご"]),
+
+        ("さ", ["さ", "ざ"]),
+        ("し", ["し", "じ"]),
+        ("す", ["す", "ず"]),
+        ("せ", ["せ", "ぜ"]),
+        ("そ", ["そ", "ぞ"]),
+
+        ("た", ["た", "だ"]),
+        ("ち", ["ち", "ぢ"]),
+        ("つ", ["つ", "づ", "っ"]),
+        ("て", ["て", "で"]),
+        ("と", ["と", "ど"]),
+
+        ("は", ["は", "ば", "ぱ"]),
+        ("ひ", ["ひ", "び", "ぴ"]),
+        ("ふ", ["ふ", "ぶ", "ぷ"]),
+        ("へ", ["へ", "べ", "ぺ"]),
+        ("ほ", ["ほ", "ぼ", "ぽ"]),
+
+        ("や", ["や", "ゃ"]),
+        ("ゆ", ["ゆ", "ゅ"]),
+        ("よ", ["よ", "ょ"]),
+
+        ("あ", ["あ", "ぁ"]),
+        ("い", ["い", "ぃ"]),
+        ("う", ["う", "ぅ"]),
+        ("え", ["え", "ぇ"]),
+        ("お", ["お", "ぉ"])
+    ]
+
+    private static let byCharacter: [Character: [Character]] = Dictionary(
+        uniqueKeysWithValues: pairs
+    )
+
+    private static let byCodeUnit: [UInt16: [UInt16]] = {
+        var result: [UInt16: [UInt16]] = [:]
+        for (key, values) in pairs {
+            guard let keyUnit = key.utf16.first else {
+                continue
+            }
+            let valueUnits = values.compactMap { $0.utf16.first }
+            result[keyUnit] = valueUnits
+        }
+        return result
+    }()
+
+    /// 指定された文字に対する置換候補を返す。常に最初の要素は自分自身。
+    static func variations(for character: Character) -> [Character] {
+        byCharacter[character] ?? [character]
+    }
+
+    /// UTF-16 code unit 単位の置換候補を返す (artifact backend 用)。
+    static func variations(for codeUnit: UInt16) -> [UInt16] {
+        byCodeUnit[codeUnit] ?? [codeUnit]
+    }
+}
+
 struct LOUDSTrie<Value: Sendable>: Sendable {
     struct PrefixMatch: Sendable {
         let length: Int
+        let value: Value
+    }
+
+    /// omission-aware search の結果。
+    /// `replaceCount` は C++ 版と同じく「置換が必要だった文字数」を指す。
+    struct OmissionMatch: Sendable {
+        let length: Int
+        let replaceCount: Int
         let value: Value
     }
 
@@ -227,6 +304,78 @@ struct LOUDSTrie<Value: Sendable>: Sendable {
         }
 
         return results
+    }
+
+    /// 濁点 / 半濁点 / 小書きなどの揺れを吸収した common prefix search。
+    ///
+    /// C++ 版 `LOUDSReaderUtf16::commonPrefixSearchWithOmission` の移植。
+    /// 入力文字列の各文字について `KanaVariations.variations(for:)` で置換候補を試し、
+    /// トライ上でノードに着地するたびに leaf を matches に拾い集める。
+    /// 同じ yomi (= 同じ node index) に複数経路で到達した場合は `replaceCount`
+    /// が最小のものを採用する。
+    func commonPrefixSearchWithOmission(
+        in characters: [Character],
+        from start: Int
+    ) -> [OmissionMatch] {
+        guard start <= characters.count else {
+            return []
+        }
+
+        // node index → 最良の (length, replaceCount)
+        var resultsByNode: [Int: (length: Int, replaceCount: Int, value: Value)] = [:]
+
+        recursiveOmissionSearch(
+            characters: characters,
+            startIndex: start,
+            strIndex: start,
+            currentNodeIndex: 0,
+            replaceCount: 0,
+            results: &resultsByNode
+        )
+
+        return resultsByNode.values.map { tuple in
+            OmissionMatch(length: tuple.length, replaceCount: tuple.replaceCount, value: tuple.value)
+        }
+    }
+
+    private func recursiveOmissionSearch(
+        characters: [Character],
+        startIndex: Int,
+        strIndex: Int,
+        currentNodeIndex: Int,
+        replaceCount: Int,
+        results: inout [Int: (length: Int, replaceCount: Int, value: Value)]
+    ) {
+        if currentNodeIndex != 0, let value = values[currentNodeIndex] {
+            let length = strIndex - startIndex
+            if let existing = results[currentNodeIndex] {
+                if replaceCount < existing.replaceCount {
+                    results[currentNodeIndex] = (length, replaceCount, value)
+                }
+            } else {
+                results[currentNodeIndex] = (length, replaceCount, value)
+            }
+        }
+
+        guard strIndex < characters.count else {
+            return
+        }
+
+        let ch = characters[strIndex]
+        for variant in KanaVariations.variations(for: ch) {
+            guard let childIndex = child(of: currentNodeIndex, matching: variant) else {
+                continue
+            }
+            let replaced = (variant != ch) ? 1 : 0
+            recursiveOmissionSearch(
+                characters: characters,
+                startIndex: startIndex,
+                strIndex: strIndex + 1,
+                currentNodeIndex: childIndex,
+                replaceCount: replaceCount + replaced,
+                results: &results
+            )
+        }
     }
 
     private func nodeIndex(for key: String) -> Int? {

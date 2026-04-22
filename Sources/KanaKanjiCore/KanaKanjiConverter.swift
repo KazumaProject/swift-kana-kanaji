@@ -139,7 +139,7 @@ public struct KanaKanjiConverter: Sendable {
             return []
         }
 
-        var graph = constructGraph(input, unknownWordCost: options.unknownWordCost)
+        var graph = constructGraph(input, options: options)
         return backwardAStar(
             graph: &graph,
             length: Array(input).count,
@@ -150,7 +150,7 @@ public struct KanaKanjiConverter: Sendable {
 
     private func constructGraph(
         _ input: String,
-        unknownWordCost: Int
+        options: ConversionOptions
     ) -> [[Node]] {
         let characters = Array(input)
         let length = characters.count
@@ -159,11 +159,21 @@ public struct KanaKanjiConverter: Sendable {
         graph[0].append(makeBOS())
         graph[length + 1].append(makeEOS(position: length + 1))
 
+        // C++ 版と同じく、predictivePrefixLength は最低 1 に正規化する。
+        let predictivePrefixLength = max(1, options.predictivePrefixLength)
+
         for position in 0..<length {
-            let matches = dictionary.prefixMatches(in: characters, from: position)
+            let matches = dictionary.prefixMatches(
+                in: characters,
+                from: position,
+                mode: options.yomiSearchMode,
+                predictivePrefixLength: predictivePrefixLength
+            )
             var foundInDictionary = false
 
             if !matches.isEmpty {
+                // common prefix / predictive / omission のいずれかで辞書ヒットがあれば
+                // unknown fallback を抑止する (従来挙動を保つ)。
                 foundInDictionary = true
                 for match in matches {
                     let endPosition = position + match.length
@@ -171,12 +181,15 @@ public struct KanaKanjiConverter: Sendable {
                         continue
                     }
 
+                    let penaltyCost = match.penalty * options.omissionPenaltyWeight
+
                     for entry in match.entries {
+                        let adjustedCost = entry.cost + penaltyCost
                         let node = Node(
                             leftId: entry.leftId,
                             rightId: entry.rightId,
-                            score: entry.cost,
-                            forwardCost: entry.cost,
+                            score: adjustedCost,
+                            forwardCost: adjustedCost,
                             surface: entry.surface,
                             yomi: entry.yomi,
                             length: match.length,
@@ -192,8 +205,8 @@ public struct KanaKanjiConverter: Sendable {
                 let node = Node(
                     leftId: 0,
                     rightId: 0,
-                    score: unknownWordCost,
-                    forwardCost: unknownWordCost,
+                    score: options.unknownWordCost,
+                    forwardCost: options.unknownWordCost,
                     surface: yomi,
                     yomi: yomi,
                     length: 1,
