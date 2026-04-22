@@ -36,43 +36,132 @@ jobs:
       - name: Build CLI
         run: swift build -c release
 
+      # ── ソースファイルの準備 ────────────────────────────────────────────────
+      # Mozc OSS 辞書を mozc_fetch/ にダウンロードし、
+      # リポジトリ内の補助辞書 TSV (Resources/bin/*.tsv) があれば同じ場所にコピーして
+      # build-all-dictionaries が 1 ディレクトリを source として使えるようにする。
       - name: Download Mozc dictionaries
         run: |
           .build/release/kana-kanji download --output mozc_fetch --overwrite
 
-      - name: Build release artifacts
+      - name: Copy supplemental TSV files (if present in repo)
+        run: |
+          # Resources/bin/ に補助辞書 TSV を置いておけば自動的に取り込まれる。
+          # ファイルが存在しない場合は静かにスキップする。
+          if [ -d Resources/bin ]; then
+            cp --no-clobber Resources/bin/*.tsv mozc_fetch/ 2>/dev/null || true
+            echo "Copied supplemental TSVs from Resources/bin/"
+          else
+            echo "Resources/bin/ not found — only main dictionary will be built."
+          fi
+
+      # ── 全辞書のビルド ──────────────────────────────────────────────────────
+      # dist/<kind>/ にそれぞれの artifact が書き出される。
+      # TSV が存在しない補助辞書は自動的にスキップされる (--no-skip-missing 指定なし)。
+      - name: Build all dictionary artifacts
         run: |
           mkdir -p dist
-          .build/release/kana-kanji build-dictionary --source mozc_fetch --output dist
+          .build/release/kana-kanji build-all-dictionaries \
+            --source mozc_fetch \
+            --output dist
+          echo "Built dictionary kinds:"
+          ls dist/
 
-      - name: Verify artifacts
+      # ── メイン辞書の検証 ────────────────────────────────────────────────────
+      - name: Verify main artifacts
         run: |
-          ls -lah dist
-          test -f dist/yomi_termid.louds
-          test -f dist/tango.louds
-          test -f dist/token_array.bin
-          test -f dist/pos_table.bin
-          test -f dist/connection_single_column.bin
+          ls -lah dist/main/
+          test -f dist/main/yomi_termid.louds
+          test -f dist/main/tango.louds
+          test -f dist/main/token_array.bin
+          test -f dist/main/pos_table.bin
+          test -f dist/main/connection_single_column.bin
 
       - name: Smoke test conversion
         run: |
           .build/release/kana-kanji \
-            --artifacts-dir dist \
-            --connection dist/connection_single_column.bin \
+            --artifacts-dir dist/main \
+            --connection dist/main/connection_single_column.bin \
             --connection-binary \
             --query きょうのてんき \
             --limit 1 | tee smoke.txt
           grep -q "今日の天気" smoke.txt
 
-      - name: Create GitHub Release and upload artifacts
+      # ── 補助辞書のスモークテスト ────────────────────────────────────────────
+      # 各種類のディレクトリが存在すれば基本的なファイル存在確認を行う。
+      - name: Verify supplemental artifacts (if built)
+        run: |
+          for kind in single_kanji emoji emoticon symbol reading_correction kotowaza; do
+            dir="dist/${kind}"
+            if [ -d "${dir}" ]; then
+              echo "Checking ${kind}..."
+              for f in yomi_termid.louds tango.louds token_array.bin pos_table.bin; do
+                test -f "${dir}/${f}" || (echo "Missing: ${dir}/${f}" && exit 1)
+              done
+              echo "  OK: ${kind}"
+            else
+              echo "Skipped (not built): ${kind}"
+            fi
+          done
+
+      # ── パッケージング ──────────────────────────────────────────────────────
+      # 辞書種類ごとにディレクトリを zip してリリースアセットを作る。
+      # 命名規則: <kind>.zip  (例: main.zip, emoji.zip)
+      #
+      # 後方互換のため main の 5 ファイルはそれぞれ個別ファイルとしても
+      # dist/ 直下にコピーしておく (既存の download URL を維持したい場合に使用)。
+      - name: Copy main artifacts to dist root (backward compat)
+        run: |
+          cp dist/main/yomi_termid.louds         dist/yomi_termid.louds
+          cp dist/main/tango.louds               dist/tango.louds
+          cp dist/main/token_array.bin           dist/token_array.bin
+          cp dist/main/pos_table.bin             dist/pos_table.bin
+          cp dist/main/connection_single_column.bin dist/connection_single_column.bin
+
+      - name: Package each dictionary kind as zip
+        run: |
+          cd dist
+          for kind_dir in */; do
+            kind="${kind_dir%/}"
+            zip -r "../${kind}.zip" "${kind_dir}"
+            echo "Packaged ${kind}.zip  ($(du -sh "../${kind}.zip" | cut -f1))"
+          done
+          cd ..
+          ls -lah *.zip
+
+      # ── GitHub Release へのアップロード ────────────────────────────────────
+      # アップロードするファイル:
+      #   - main.zip         … メイン Mozc 辞書 (5 artifact)
+      #   - <kind>.zip       … 各補助辞書 (ビルドされた分のみ)
+      #   - 個別ファイル (後方互換用) … yomi_termid.louds など main 5 ファイル
+      #
+      # fail_on_unmatched_files を kind ごとに制御できないため、
+      # ① 必須ファイル (main 個別 + main.zip) と
+      # ② 任意ファイル (補助辞書 zip) を 2 ステップに分けてアップロードする。
+      - name: Upload required artifacts (main dictionary)
         uses: softprops/action-gh-release@v2
         with:
           name: ${{ github.event.inputs.tag_name || github.ref_name }}
           tag_name: ${{ github.event.inputs.tag_name || github.ref_name }}
           fail_on_unmatched_files: true
           files: |
+            main.zip
             dist/yomi_termid.louds
             dist/tango.louds
             dist/token_array.bin
             dist/pos_table.bin
             dist/connection_single_column.bin
+
+      - name: Upload supplemental dictionary zips (best-effort)
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ github.event.inputs.tag_name || github.ref_name }}
+          tag_name: ${{ github.event.inputs.tag_name || github.ref_name }}
+          fail_on_unmatched_files: false
+          files: |
+            single_kanji.zip
+            emoji.zip
+            emoticon.zip
+            symbol.zip
+            reading_correction.zip
+            kotowaza.zip

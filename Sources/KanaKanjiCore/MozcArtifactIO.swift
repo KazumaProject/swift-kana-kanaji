@@ -1,5 +1,11 @@
 import Foundation
 
+/// Low-level artifact I/O for the kana-kanji dictionary format.
+///
+/// All public-facing builder and loader functionality is exposed through the
+/// higher-level ``DictionaryArtifactBuilder`` type.  This enum owns the binary
+/// encoding/decoding details (LOUDS, token array, POS table, connection matrix)
+/// and is shared by all dictionary kinds.
 enum MozcArtifactIO {
     static let requiredFileNames = [
         "yomi_termid.louds",
@@ -9,6 +15,11 @@ enum MozcArtifactIO {
         "connection_single_column.bin"
     ]
 
+    // MARK: - Load
+
+    /// Loads a ``MozcArtifactDictionary`` from the four standard artifact files
+    /// in `directory`.  Works for any ``DictionaryKind`` — connection matrix is
+    /// not loaded here (it is handled separately by ``ConnectionMatrix``).
     static func loadDictionary(from directory: URL) throws -> MozcArtifactDictionary {
         MozcArtifactDictionary(
             yomiTerm: try readLOUDSWithTermId(directory.appendingPathComponent("yomi_termid.louds")),
@@ -18,8 +29,40 @@ enum MozcArtifactIO {
         )
     }
 
+    // MARK: - Build (main Mozc dictionary)
+
+    /// Builds artifacts for the **main** Mozc dictionary.
+    ///
+    /// Reads `dictionary00.txt`–`dictionary09.txt` from `sourceDirectory`,
+    /// writes the four standard artifact files plus `connection_single_column.bin`
+    /// (if `connection_single_column.txt` is present) to `outputDirectory`.
     static func writeDictionaryArtifacts(from sourceDirectory: URL, to outputDirectory: URL) throws {
-        let entries = try loadAllEntries(from: sourceDirectory)
+        let entries = try loadAllMozcEntries(from: sourceDirectory)
+        try FileManager.default.createDirectory(at: outputDirectory, withIntermediateDirectories: true)
+
+        try buildAndWriteArtifacts(entries: entries, to: outputDirectory)
+
+        let connectionText = sourceDirectory.appendingPathComponent("connection_single_column.txt")
+        if FileManager.default.fileExists(atPath: connectionText.path) {
+            let values = try readConnectionText(connectionText)
+            try writeBigEndianInt16(values, to: outputDirectory.appendingPathComponent("connection_single_column.bin"))
+        }
+    }
+
+    // MARK: - Build (generic, shared by all kinds)
+
+    /// Builds and writes the four standard artifact files from a flat list of
+    /// ``DictionaryEntry`` values.
+    ///
+    /// This is the shared core used by both the main dictionary builder and every
+    /// supplemental dictionary builder.  It does **not** write
+    /// `connection_single_column.bin`; that is handled separately for `.main`.
+    ///
+    /// - Parameters:
+    ///   - entries: Pre-parsed dictionary entries (any kind).
+    ///   - outputDirectory: Directory that receives `yomi_termid.louds`,
+    ///     `tango.louds`, `token_array.bin`, and `pos_table.bin`.
+    static func buildAndWriteArtifacts(entries: [DictionaryEntry], to outputDirectory: URL) throws {
         try FileManager.default.createDirectory(at: outputDirectory, withIntermediateDirectories: true)
 
         var grouped: [String: [DictionaryEntry]] = [:]
@@ -28,6 +71,8 @@ enum MozcArtifactIO {
             grouped[entry.yomi, default: []].append(entry)
         }
 
+        // Sort keys by UTF-16 code unit length first, then lexicographically —
+        // matching the Kotlin reference sort order.
         let keys = grouped.keys.sorted { lhs, rhs in
             let l = Array(lhs.utf16)
             let r = Array(rhs.utf16)
@@ -54,17 +99,18 @@ enum MozcArtifactIO {
         try writeLOUDS(yomiBuilt.louds, to: outputDirectory.appendingPathComponent("yomi_termid.louds"))
         try writeLOUDS(tangoBuilt.louds, to: outputDirectory.appendingPathComponent("tango.louds"))
 
-        let tokenArray = buildTokenArray(keys: keys, grouped: grouped, posIndexByPair: pos.indexByPair, tangoNodeIndexBySurface: tangoBuilt.nodeIndexByKey)
+        let tokenArray = buildTokenArray(
+            keys: keys,
+            grouped: grouped,
+            posIndexByPair: pos.indexByPair,
+            tangoNodeIndexBySurface: tangoBuilt.nodeIndexByKey
+        )
         try writeTokenArray(tokenArray, to: outputDirectory.appendingPathComponent("token_array.bin"))
-
-        let connectionText = sourceDirectory.appendingPathComponent("connection_single_column.txt")
-        if FileManager.default.fileExists(atPath: connectionText.path) {
-            let values = try readConnectionText(connectionText)
-            try writeBigEndianInt16(values, to: outputDirectory.appendingPathComponent("connection_single_column.bin"))
-        }
     }
 
-    private static func loadAllEntries(from directory: URL) throws -> [DictionaryEntry] {
+    // MARK: - Main dictionary entry loading
+
+    private static func loadAllMozcEntries(from directory: URL) throws -> [DictionaryEntry] {
         var entries: [DictionaryEntry] = []
         for index in 0..<10 {
             let fileURL = directory.appendingPathComponent(String(format: "dictionary%02d.txt", index))
@@ -75,6 +121,8 @@ enum MozcArtifactIO {
         }
         return entries
     }
+
+    // MARK: - LOUDS / POS / token build helpers
 
     private static func buildPosTable(
         keys: [String],
@@ -192,6 +240,8 @@ enum MozcArtifactIO {
         )
     }
 
+    // MARK: - Binary read helpers
+
     private static func readLOUDS(_ fileURL: URL) throws -> CompatibleLOUDS {
         var reader = BinaryReader(data: try Data(contentsOf: fileURL))
         let lbs = try readBitVector(reader: &reader)
@@ -255,6 +305,8 @@ enum MozcArtifactIO {
         for _ in 0..<count { right.append(try reader.readInt16LE()) }
         return CompatiblePosTable(leftIds: left, rightIds: right)
     }
+
+    // MARK: - Binary write helpers
 
     private static func writeLOUDS(_ louds: CompatibleLOUDS, to fileURL: URL) throws {
         var writer = BinaryWriter()
@@ -324,6 +376,8 @@ enum MozcArtifactIO {
         try data.write(to: fileURL, options: .atomic)
     }
 
+    // MARK: - Unicode predicates
+
     private static func packPair(left: Int, right: Int) -> UInt32 {
         (UInt32(UInt16(bitPattern: Int16(left))) << 16) | UInt32(UInt16(bitPattern: Int16(right)))
     }
@@ -343,7 +397,11 @@ enum MozcArtifactIO {
     }
 }
 
-private final class UTF16Trie {
+// MARK: - UTF-16 Trie (internal build helper)
+
+/// A simple mutable UTF-16 trie used during artifact construction.
+/// Not part of the public API.
+final class UTF16Trie {
     final class Node {
         var isWord = false
         var termId: Int32 = -1
