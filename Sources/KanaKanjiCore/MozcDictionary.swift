@@ -96,6 +96,15 @@ public struct MozcDictionary: Sendable {
         try MozcArtifactIO.writeDictionaryArtifacts(from: sourceDirectory, to: outputDirectory)
     }
 
+    /// Loads a ``MozcDictionary`` for the given ``DictionaryKind`` from its
+    /// subdirectory inside `rootDirectory`.
+    ///
+    /// This is a convenience wrapper around ``DictionaryArtifactBuilder/load(kind:from:)``.
+    /// It does not load a connection matrix — supply one separately if needed.
+    public static func load(kind: DictionaryKind, from rootDirectory: URL) throws -> MozcDictionary {
+        try DictionaryArtifactBuilder.load(kind: kind, from: rootDirectory)
+    }
+
     public static func loadTSV(_ fileURL: URL) throws -> [DictionaryEntry] {
         guard FileManager.default.fileExists(atPath: fileURL.path) else {
             throw KanaKanjiError.dictionaryNotFound(fileURL)

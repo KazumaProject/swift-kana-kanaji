@@ -484,3 +484,518 @@ final class KanaKanjiCoreTests: XCTestCase {
         ))
     }
 }
+
+// MARK: - AuxiliaryDictionaryParser tests
+
+final class AuxiliaryDictionaryParserTests: XCTestCase {
+
+    // MARK: Helpers
+
+    private func writeTemp(_ content: String, name: String) throws -> URL {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: dir) }
+        let url = dir.appendingPathComponent(name)
+        try content.write(to: url, atomically: true, encoding: .utf8)
+        return url
+    }
+
+    // MARK: Emoji
+
+    func testParseEmojiBasic() throws {
+        // First column is the emoji; subsequent tab-separated columns hold
+        // space-separated yomi strings.
+        let tsv = "#️⃣\t# かこみすうじ しゃーぷ\n©️\tCまーく きごう\n"
+        let url = try writeTemp(tsv, name: "emoji_data.tsv")
+
+        let entries = try AuxiliaryDictionaryParser.parseEmoji(from: url)
+
+        // "#️⃣" should yield 3 entries (one per yomi token in the column)
+        let hashEntries = entries.filter { $0.surface == "#️⃣" }
+        XCTAssertEqual(hashEntries.count, 3)
+        XCTAssertTrue(hashEntries.contains { $0.yomi == "#" })
+        XCTAssertTrue(hashEntries.contains { $0.yomi == "かこみすうじ" })
+        XCTAssertTrue(hashEntries.contains { $0.yomi == "しゃーぷ" })
+
+        // Default POS IDs and cost
+        XCTAssertEqual(hashEntries.first?.leftId, 2641)
+        XCTAssertEqual(hashEntries.first?.rightId, 2641)
+        XCTAssertEqual(hashEntries.first?.cost, 6000)
+    }
+
+    func testParseEmojiMultipleYomiColumns() throws {
+        // Two yomi columns, each with multiple space-separated yomis
+        let tsv = "😀\tえもじ わらい\tにこにこ\n"
+        let url = try writeTemp(tsv, name: "emoji_data.tsv")
+
+        let entries = try AuxiliaryDictionaryParser.parseEmoji(from: url)
+
+        XCTAssertEqual(entries.count, 3)
+        let yomis = Set(entries.map(\.yomi))
+        XCTAssertEqual(yomis, ["えもじ", "わらい", "にこにこ"])
+    }
+
+    // MARK: Emoticon
+
+    func testParseEmoticonBasic() throws {
+        let tsv = "＼(^o^)／\tにこにこ にこっ ばんざい\n(^o^)\tにこにこ にこっ\n"
+        let url = try writeTemp(tsv, name: "emoticon.tsv")
+
+        let entries = try AuxiliaryDictionaryParser.parseEmoticon(from: url)
+
+        let firstEntries = entries.filter { $0.surface == "＼(^o^)／" }
+        XCTAssertEqual(firstEntries.count, 3)
+        XCTAssertEqual(firstEntries.first?.cost, 4000)  // emoticon cost ≠ emoji cost
+    }
+
+    func testParseEmoticonSkipsEmptyYomi() throws {
+        // Trailing tab with no yomi should not produce empty-yomi entries
+        let tsv = "(^^)\tにこ \n"
+        let url = try writeTemp(tsv, name: "emoticon.tsv")
+
+        let entries = try AuxiliaryDictionaryParser.parseEmoticon(from: url)
+        XCTAssertFalse(entries.contains { $0.yomi.isEmpty })
+    }
+
+    // MARK: Symbol
+
+    func testParseSymbolBasic() throws {
+        let tsv = "、\tとうてん , 、 てん\n。\tくてん . まる\n"
+        let url = try writeTemp(tsv, name: "symbol.tsv")
+
+        let entries = try AuxiliaryDictionaryParser.parseSymbol(from: url)
+
+        let tenEntries = entries.filter { $0.surface == "、" }
+        XCTAssertTrue(tenEntries.count >= 3)
+        XCTAssertTrue(tenEntries.contains { $0.yomi == "とうてん" })
+        XCTAssertTrue(tenEntries.contains { $0.yomi == "," })
+
+        XCTAssertEqual(tenEntries.first?.leftId, 2641)
+        XCTAssertEqual(tenEntries.first?.cost, 4000)
+    }
+
+    func testParseSymbolSkipsEmptyLines() throws {
+        let tsv = "？\tはてな\n\n！\tびっくり\n"
+        let url = try writeTemp(tsv, name: "symbol.tsv")
+
+        let entries = try AuxiliaryDictionaryParser.parseSymbol(from: url)
+        XCTAssertEqual(entries.count, 2)
+    }
+
+    // MARK: Reading Correction
+
+    func testParseReadingCorrectionThreeColumns() throws {
+        // Format: surface \t wrongYomi \t correctYomi
+        let tsv = "お土産\tおどさん\tおみやげ\n一応\tいちよう\tいちおう\n"
+        let url = try writeTemp(tsv, name: "reading_correction.tsv")
+
+        let entries = try AuxiliaryDictionaryParser.parseReadingCorrection(from: url)
+
+        XCTAssertEqual(entries.count, 2)
+
+        let first = entries[0]
+        // yomi is the wrong reading
+        XCTAssertEqual(first.yomi, "おどさん")
+        // surface encodes the display text and correct reading, tab-separated
+        XCTAssertTrue(first.surface.contains("\t"))
+        let parts = first.surface.split(separator: "\t", omittingEmptySubsequences: false)
+        XCTAssertEqual(String(parts[0]), "お土産")
+        XCTAssertEqual(String(parts[1]), "おみやげ")
+
+        XCTAssertEqual(first.leftId, 1851)
+        XCTAssertEqual(first.cost, 4000)
+    }
+
+    func testParseReadingCorrectionSkipsMalformedLines() throws {
+        // Lines with != 3 columns should be skipped
+        let tsv = "お土産\tおどさん\tおみやげ\nonly_one_col\n"
+        let url = try writeTemp(tsv, name: "reading_correction.tsv")
+
+        let entries = try AuxiliaryDictionaryParser.parseReadingCorrection(from: url)
+        XCTAssertEqual(entries.count, 1)
+    }
+
+    // MARK: Kotowaza
+
+    func testParseKotowazaTwoColumns() throws {
+        let tsv = "七味とうがらし\tしちみとうがらし\n一期一会\tいちごいちえ\n"
+        let url = try writeTemp(tsv, name: "kotowaza.tsv")
+
+        let entries = try AuxiliaryDictionaryParser.parseKotowaza(from: url)
+
+        XCTAssertEqual(entries.count, 2)
+        XCTAssertEqual(entries[0].surface, "七味とうがらし")
+        XCTAssertEqual(entries[0].yomi, "しちみとうがらし")
+        XCTAssertEqual(entries[0].leftId, 1851)
+        XCTAssertEqual(entries[0].cost, 3000)  // kotowaza cost differs from reading_correction
+    }
+
+    // MARK: Single Kanji
+
+    func testParseSingleKanjiTabSeparated() throws {
+        // Format: yomi \t KANJI_STRING  — each character in KANJI_STRING is an entry
+        let tsv = "あ\t亜哀挨\nい\t以位\n"
+        let url = try writeTemp(tsv, name: "single_kanji.tsv")
+
+        let entries = try AuxiliaryDictionaryParser.parseSingleKanji(from: url)
+
+        XCTAssertEqual(entries.count, 5)  // 3 for あ + 2 for い
+
+        let aEntries = entries.filter { $0.yomi == "あ" }
+        XCTAssertEqual(aEntries.count, 3)
+        XCTAssertTrue(aEntries.contains { $0.surface == "亜" })
+        XCTAssertTrue(aEntries.contains { $0.surface == "哀" })
+        XCTAssertTrue(aEntries.contains { $0.surface == "挨" })
+
+        XCTAssertEqual(aEntries.first?.leftId, 1916)
+        XCTAssertEqual(aEntries.first?.rightId, 1916)
+        XCTAssertEqual(aEntries.first?.cost, 5000)
+    }
+
+    func testParseSingleKanjiCommaSeparated() throws {
+        let csv = "う,上氏\n"
+        let url = try writeTemp(csv, name: "single_kanji.tsv")
+
+        let entries = try AuxiliaryDictionaryParser.parseSingleKanji(from: url)
+        XCTAssertEqual(entries.count, 2)
+        XCTAssertTrue(entries.allSatisfy { $0.yomi == "う" })
+    }
+
+    // MARK: Dispatch
+
+    func testParseDispatchThrowsForMain() throws {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("dummy.tsv")
+        do {
+            _ = try AuxiliaryDictionaryParser.parse(kind: .main, from: url)
+            XCTFail("Expected error for .main kind")
+        } catch KanaKanjiError.unsupportedKindForParsing(_) {
+            // expected
+        }
+    }
+
+    func testParseDispatchRoutesAllSupplementalKinds() throws {
+        // Each supplemental kind must produce at least one entry from minimal input.
+        let emojiURL   = try writeTemp("😀\tえもじ\n", name: "emoji_data.tsv")
+        let emotiURL   = try writeTemp("(^^)\tにこ\n", name: "emoticon.tsv")
+        let symbolURL  = try writeTemp("！\tびっくり\n", name: "symbol.tsv")
+        let rcURL      = try writeTemp("お土産\tおどさん\tおみやげ\n", name: "reading_correction.tsv")
+        let kotURL     = try writeTemp("一期一会\tいちごいちえ\n", name: "kotowaza.tsv")
+        let skURL      = try writeTemp("あ\t亜\n", name: "single_kanji.tsv")
+
+        let cases: [(DictionaryKind, URL)] = [
+            (.emoji,             emojiURL),
+            (.emoticon,          emotiURL),
+            (.symbol,            symbolURL),
+            (.readingCorrection, rcURL),
+            (.kotowaza,          kotURL),
+            (.singleKanji,       skURL),
+        ]
+
+        for (kind, url) in cases {
+            let entries = try AuxiliaryDictionaryParser.parse(kind: kind, from: url)
+            XCTAssertFalse(entries.isEmpty, "Expected entries for kind '\(kind.rawValue)'")
+        }
+    }
+}
+
+// MARK: - DictionaryArtifactBuilder build + load tests
+
+final class DictionaryArtifactBuilderTests: XCTestCase {
+
+    // MARK: Helpers
+
+    private func makeTempDir() throws -> URL {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: dir) }
+        return dir
+    }
+
+    private func writeFile(_ content: String, name: String, in dir: URL) throws {
+        try content.write(to: dir.appendingPathComponent(name), atomically: true, encoding: .utf8)
+    }
+
+    // MARK: Build from entries
+
+    func testBuildFromEntriesProducesCoreArtifacts() throws {
+        let outputDir = try makeTempDir()
+        let entries = [
+            DictionaryEntry(yomi: "えもじ", leftId: 2641, rightId: 2641, cost: 6000, surface: "😀"),
+            DictionaryEntry(yomi: "にこ",   leftId: 2641, rightId: 2641, cost: 6000, surface: "😊"),
+        ]
+
+        try DictionaryArtifactBuilder.buildFromEntries(entries, to: outputDir)
+
+        for name in ["yomi_termid.louds", "tango.louds", "token_array.bin", "pos_table.bin"] {
+            XCTAssertTrue(
+                FileManager.default.fileExists(atPath: outputDir.appendingPathComponent(name).path),
+                "Expected artifact '\(name)' to exist"
+            )
+        }
+    }
+
+    // MARK: Build emoji
+
+    func testBuildEmojiArtifactsAndLoad() throws {
+        let sourceDir = try makeTempDir()
+        let outputRoot = try makeTempDir()
+
+        try writeFile(
+            "😀\tえもじ わらい\n😊\tにこにこ\n",
+            name: "emoji_data.tsv",
+            in: sourceDir
+        )
+
+        try DictionaryArtifactBuilder.build(kind: .emoji, from: sourceDir, to: outputRoot)
+
+        let emojiDir = DictionaryArtifactBuilder.artifactDirectory(kind: .emoji, in: outputRoot)
+        for name in DictionaryKind.emoji.artifactFileNames {
+            XCTAssertTrue(
+                FileManager.default.fileExists(atPath: emojiDir.appendingPathComponent(name).path),
+                "Missing artifact: \(name)"
+            )
+        }
+
+        // Load and perform a lookup
+        let dict = try DictionaryArtifactBuilder.load(kind: .emoji, from: outputRoot)
+        let matches = dict.prefixMatches(in: Array("えもじ"), from: 0)
+        let surfaces = Set(matches.flatMap { $0.entries.map(\.surface) })
+        XCTAssertTrue(surfaces.contains("😀"), "Expected 😀 for 'えもじ'")
+    }
+
+    // MARK: Build emoticon
+
+    func testBuildEmoticonArtifactsAndLoad() throws {
+        let sourceDir = try makeTempDir()
+        let outputRoot = try makeTempDir()
+
+        try writeFile(
+            "＼(^o^)／\tばんざい にこにこ\n(T_T)\tなく\n",
+            name: "emoticon.tsv",
+            in: sourceDir
+        )
+
+        try DictionaryArtifactBuilder.build(kind: .emoticon, from: sourceDir, to: outputRoot)
+        let dict = try DictionaryArtifactBuilder.load(kind: .emoticon, from: outputRoot)
+
+        let matches = dict.prefixMatches(in: Array("ばんざい"), from: 0)
+        let surfaces = Set(matches.flatMap { $0.entries.map(\.surface) })
+        XCTAssertTrue(surfaces.contains("＼(^o^)／"))
+    }
+
+    // MARK: Build symbol
+
+    func testBuildSymbolArtifactsAndLoad() throws {
+        let sourceDir = try makeTempDir()
+        let outputRoot = try makeTempDir()
+
+        try writeFile(
+            "、\tとうてん てん\n。\tくてん まる\n",
+            name: "symbol.tsv",
+            in: sourceDir
+        )
+
+        try DictionaryArtifactBuilder.build(kind: .symbol, from: sourceDir, to: outputRoot)
+        let dict = try DictionaryArtifactBuilder.load(kind: .symbol, from: outputRoot)
+
+        let matches = dict.prefixMatches(in: Array("とうてん"), from: 0)
+        let surfaces = Set(matches.flatMap { $0.entries.map(\.surface) })
+        XCTAssertTrue(surfaces.contains("、"))
+    }
+
+    // MARK: Build reading correction
+
+    func testBuildReadingCorrectionArtifactsAndLoad() throws {
+        let sourceDir = try makeTempDir()
+        let outputRoot = try makeTempDir()
+
+        try writeFile(
+            "お土産\tおどさん\tおみやげ\n一応\tいちよう\tいちおう\n",
+            name: "reading_correction.tsv",
+            in: sourceDir
+        )
+
+        try DictionaryArtifactBuilder.build(kind: .readingCorrection, from: sourceDir, to: outputRoot)
+        let dict = try DictionaryArtifactBuilder.load(kind: .readingCorrection, from: outputRoot)
+
+        // Wrong reading "おどさん" should map to "お土産\tおみやげ"
+        let matches = dict.prefixMatches(in: Array("おどさん"), from: 0)
+        XCTAssertFalse(matches.isEmpty, "Expected match for wrongYomi 'おどさん'")
+        let surface = matches.first?.entries.first?.surface ?? ""
+        XCTAssertTrue(surface.hasPrefix("お土産"), "Surface should start with 'お土産'")
+        XCTAssertTrue(surface.contains("おみやげ"), "Surface should contain correct yomi 'おみやげ'")
+    }
+
+    // MARK: Build kotowaza
+
+    func testBuildKotowazaArtifactsAndLoad() throws {
+        let sourceDir = try makeTempDir()
+        let outputRoot = try makeTempDir()
+
+        try writeFile(
+            "一期一会\tいちごいちえ\n七味とうがらし\tしちみとうがらし\n",
+            name: "kotowaza.tsv",
+            in: sourceDir
+        )
+
+        try DictionaryArtifactBuilder.build(kind: .kotowaza, from: sourceDir, to: outputRoot)
+        let dict = try DictionaryArtifactBuilder.load(kind: .kotowaza, from: outputRoot)
+
+        let matches = dict.prefixMatches(in: Array("いちごいちえ"), from: 0)
+        let surfaces = Set(matches.flatMap { $0.entries.map(\.surface) })
+        XCTAssertTrue(surfaces.contains("一期一会"))
+    }
+
+    // MARK: Build single kanji
+
+    func testBuildSingleKanjiArtifactsAndLoad() throws {
+        let sourceDir = try makeTempDir()
+        let outputRoot = try makeTempDir()
+
+        try writeFile("あ\t亜哀\nい\t以位\n", name: "single_kanji.tsv", in: sourceDir)
+
+        try DictionaryArtifactBuilder.build(kind: .singleKanji, from: sourceDir, to: outputRoot)
+        let dict = try DictionaryArtifactBuilder.load(kind: .singleKanji, from: outputRoot)
+
+        let matches = dict.prefixMatches(in: Array("あ"), from: 0)
+        let surfaces = Set(matches.flatMap { $0.entries.map(\.surface) })
+        XCTAssertTrue(surfaces.contains("亜"), "Expected '亜' for yomi 'あ'")
+        XCTAssertTrue(surfaces.contains("哀"), "Expected '哀' for yomi 'あ'")
+    }
+
+    // MARK: Build all (supplemental only, skip main)
+
+    func testBuildAllSkipsMissingSourceFiles() throws {
+        let sourceDir = try makeTempDir()
+        let outputRoot = try makeTempDir()
+
+        // Only provide emoji; all others are absent
+        try writeFile("🎉\tぱーてぃー\n", name: "emoji_data.tsv", in: sourceDir)
+
+        let built = try DictionaryArtifactBuilder.buildAll(
+            from: sourceDir,
+            to: outputRoot,
+            skipMissingSupplemental: true
+        )
+
+        // main will fail (no dictionary*.txt), others missing TSVs are skipped
+        XCTAssertTrue(built.contains(.emoji))
+        XCTAssertFalse(built.contains(.main))
+    }
+
+    func testBuildAllBuildsMultipleKinds() throws {
+        let sourceDir = try makeTempDir()
+        let outputRoot = try makeTempDir()
+
+        try writeFile("😀\tえもじ\n", name: "emoji_data.tsv", in: sourceDir)
+        try writeFile("(^^)\tにこ\n", name: "emoticon.tsv", in: sourceDir)
+        try writeFile("！\tびっくり\n", name: "symbol.tsv", in: sourceDir)
+
+        let built = try DictionaryArtifactBuilder.buildAll(
+            from: sourceDir,
+            to: outputRoot,
+            skipMissingSupplemental: true
+        )
+
+        XCTAssertTrue(built.contains(.emoji))
+        XCTAssertTrue(built.contains(.emoticon))
+        XCTAssertTrue(built.contains(.symbol))
+    }
+
+    // MARK: loadAll
+
+    func testLoadAllReturnsOnlyBuiltKinds() throws {
+        let sourceDir = try makeTempDir()
+        let outputRoot = try makeTempDir()
+
+        try writeFile("😀\tえもじ\n", name: "emoji_data.tsv", in: sourceDir)
+        try writeFile("(^^)\tにこ\n", name: "emoticon.tsv", in: sourceDir)
+
+        try DictionaryArtifactBuilder.buildAll(
+            from: sourceDir,
+            to: outputRoot,
+            skipMissingSupplemental: true
+        )
+
+        let loaded = try DictionaryArtifactBuilder.loadAll(from: outputRoot)
+        XCTAssertNotNil(loaded[.emoji])
+        XCTAssertNotNil(loaded[.emoticon])
+        XCTAssertNil(loaded[.main])
+    }
+
+    // MARK: DictionaryKind properties
+
+    func testDictionaryKindOutputDirectoryName() {
+        XCTAssertEqual(DictionaryKind.main.outputDirectoryName, "main")
+        XCTAssertEqual(DictionaryKind.singleKanji.outputDirectoryName, "single_kanji")
+        XCTAssertEqual(DictionaryKind.readingCorrection.outputDirectoryName, "reading_correction")
+    }
+
+    func testDictionaryKindRequiresConnectionMatrixOnlyForMain() {
+        XCTAssertTrue(DictionaryKind.main.requiresConnectionMatrix)
+        for kind in DictionaryKind.allCases where kind != .main {
+            XCTAssertFalse(kind.requiresConnectionMatrix, "'\(kind.rawValue)' should not require connection matrix")
+        }
+    }
+
+    func testDictionaryKindArtifactFileNamesContainConnectionOnlyForMain() {
+        XCTAssertTrue(DictionaryKind.main.artifactFileNames.contains("connection_single_column.bin"))
+        for kind in DictionaryKind.allCases where kind != .main {
+            XCTAssertFalse(
+                kind.artifactFileNames.contains("connection_single_column.bin"),
+                "'\(kind.rawValue)' should not list connection_single_column.bin"
+            )
+        }
+    }
+
+    // MARK: MozcDictionary.load(kind:from:) convenience
+
+    func testMozcDictionaryLoadKindConvenience() throws {
+        let sourceDir = try makeTempDir()
+        let outputRoot = try makeTempDir()
+
+        try writeFile("🎉\tぱーてぃー\n", name: "emoji_data.tsv", in: sourceDir)
+        try DictionaryArtifactBuilder.build(kind: .emoji, from: sourceDir, to: outputRoot)
+
+        let dict = try MozcDictionary.load(kind: .emoji, from: outputRoot)
+        let matches = dict.prefixMatches(in: Array("ぱーてぃー"), from: 0)
+        let surfaces = Set(matches.flatMap { $0.entries.map(\.surface) })
+        XCTAssertTrue(surfaces.contains("🎉"))
+    }
+
+    // MARK: Existing main dictionary round-trip still works
+
+    func testMainDictionaryRoundTripUnchanged() throws {
+        let sourceDir = try makeTempDir()
+        let outputDir = try makeTempDir()
+
+        try writeFile(
+            "きょう\t1\t1\t100\t今日\nてんき\t1\t1\t80\t天気\n",
+            name: "dictionary00.txt",
+            in: sourceDir
+        )
+        for i in 1..<10 {
+            try writeFile("", name: String(format: "dictionary%02d.txt", i), in: sourceDir)
+        }
+        try writeFile("0\n0\n0\n0\n", name: "connection_single_column.txt", in: sourceDir)
+
+        // Existing flat-output API must still work unchanged
+        try MozcDictionary.buildArtifacts(from: sourceDir, to: outputDir)
+
+        for name in ["yomi_termid.louds", "tango.louds", "token_array.bin", "pos_table.bin",
+                     "connection_single_column.bin"] {
+            XCTAssertTrue(
+                FileManager.default.fileExists(atPath: outputDir.appendingPathComponent(name).path),
+                "Missing main artifact: \(name)"
+            )
+        }
+
+        let dict = try MozcDictionary(artifactsDirectory: outputDir)
+        let matches = dict.prefixMatches(in: Array("きょう"), from: 0)
+        XCTAssertFalse(matches.isEmpty)
+        let surfaces = Set(matches.flatMap { $0.entries.map(\.surface) })
+        XCTAssertTrue(surfaces.contains("今日"))
+    }
+}

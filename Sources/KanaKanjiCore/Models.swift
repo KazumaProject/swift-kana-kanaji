@@ -92,6 +92,9 @@ public enum KanaKanjiError: Error, LocalizedError {
     case invalidInteger(field: String, value: String, file: URL, line: Int)
     case connectionMatrixIsEmpty(URL)
     case connectionMatrixIsNotSquare(URL, count: Int)
+    /// Thrown when ``AuxiliaryDictionaryParser`` is called with `.main`, which
+    /// does not have a single TSV source file.
+    case unsupportedKindForParsing(DictionaryKind)
 
     public var errorDescription: String? {
         switch self {
@@ -107,6 +110,8 @@ public enum KanaKanjiError: Error, LocalizedError {
             return "Connection matrix is empty: \(url.path)"
         case .connectionMatrixIsNotSquare(let url, let count):
             return "Connection matrix value count is not a square number at \(url.path): \(count)"
+        case .unsupportedKindForParsing(let kind):
+            return "DictionaryKind '\(kind.rawValue)' cannot be parsed from a single TSV; use MozcArtifactIO for .main."
         }
     }
 }
