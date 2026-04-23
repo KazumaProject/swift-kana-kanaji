@@ -282,9 +282,17 @@ final class EnglishDictionaryBuilderTests: XCTestCase {
 
     // MARK: - Prediction: no match
 
+    /// With the enhanced engine, an unknown prefix always yields the three
+    /// input-based fallback candidates (original / capitalised / all-upper).
     func testNoPredictionForUnknownPrefix() throws {
         let (_, engine) = try buildFromFixture()
-        XCTAssertTrue(engine.getPrediction(input: "xyz").isEmpty)
+        let results = engine.getPrediction(input: "xyz")
+        XCTAssertFalse(results.isEmpty, "unknown prefix must return fallback candidates, not an empty array")
+        XCTAssertEqual(results.count, 3, "fallback always contains exactly 3 candidates")
+        let words = Set(results.map(\.word))
+        XCTAssertTrue(words.contains("xyz"), "fallback must include the raw input")
+        XCTAssertTrue(words.contains("Xyz"), "fallback must include the first-letter-uppercased input")
+        XCTAssertTrue(words.contains("XYZ"), "fallback must include the all-uppercased input")
     }
 
     // MARK: - Empty input
@@ -358,5 +366,250 @@ final class EnglishBuildAllIntegrationTests: XCTestCase {
             FileManager.default.fileExists(atPath: englishDir.path),
             "english/ should not be created when zip is absent"
         )
+    }
+}
+
+// MARK: - EnglishEngine Kotlin-parity tests
+
+/// Tests that verify ``EnglishEngine.getPrediction(input:)`` matches the
+/// behaviour described in the Kotlin `EnglishEngine.getCandidates` spec:
+/// input variants, predictive candidates with casing variants, deduplication,
+/// score ordering, fallback, and limit enforcement.
+final class EnglishEngineKotlinParityTests: XCTestCase {
+
+    // MARK: - Fixture
+
+    /// A small dictionary that covers: plain-lowercase word, mixed-case word,
+    /// and an all-caps word (stored via word trie).
+    private static let fixture: [EnglishDictionaryEntry] = [
+        EnglishDictionaryEntry(reading: "hello",  cost: 100,  word: "hello"),
+        EnglishDictionaryEntry(reading: "help",   cost: 150,  word: "help"),
+        EnglishDictionaryEntry(reading: "ios",    cost: 200,  word: "iOS"),
+        EnglishDictionaryEntry(reading: "github", cost: 300,  word: "GitHub"),
+        EnglishDictionaryEntry(reading: "nasa",   cost:  50,  word: "NASA"),
+    ]
+
+    // MARK: - Helpers
+
+    private func makeTempDir() throws -> URL {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: dir) }
+        return dir
+    }
+
+    private func buildEngine(entries: [EnglishDictionaryEntry]) throws -> EnglishEngine {
+        let outputDir = try makeTempDir()
+        try EnglishDictionaryBuilder.build(entries: entries, to: outputDir)
+        let dictionary = try EnglishDictionary(artifactsDirectory: outputDir)
+        return EnglishEngine(dictionary: dictionary)
+    }
+
+    private func fixtureEngine() throws -> EnglishEngine {
+        try buildEngine(entries: Self.fixture)
+    }
+
+    // MARK: - 1. 空文字で空配列
+
+    func testEmptyInputReturnsEmptyArray() throws {
+        let engine = try fixtureEngine()
+        XCTAssertTrue(engine.getPrediction(input: "").isEmpty,
+                      "empty input must return an empty array")
+    }
+
+    // MARK: - 2. 入力そのもの / 先頭大文字 / 全大文字が返る
+
+    func testInputVariantsAlwaysPresentWhenPredictiveHits() throws {
+        let engine = try fixtureEngine()
+        let results = engine.getPrediction(input: "hel")
+        let words = Set(results.map(\.word))
+        XCTAssertTrue(words.contains("hel"), "original input must be present")
+        XCTAssertTrue(words.contains("Hel"), "first-letter-uppercased input must be present")
+        XCTAssertTrue(words.contains("HEL"), "all-uppercased input must be present")
+    }
+
+    func testInputVariantsAlwaysPresentForMixedCase() throws {
+        // Input already starts with uppercase.
+        let engine = try fixtureEngine()
+        let results = engine.getPrediction(input: "Hel")
+        let words = Set(results.map(\.word))
+        XCTAssertTrue(words.contains("Hel"), "original mixed-case input must be present")
+        XCTAssertTrue(words.contains("HEL"), "all-upper variant must be present")
+    }
+
+    // MARK: - 3. predictive search の候補が返る
+
+    func testPredictiveDictionaryCandidatesIncluded() throws {
+        let engine = try fixtureEngine()
+        let results = engine.getPrediction(input: "hel")
+        let words = Set(results.map(\.word))
+        XCTAssertTrue(words.contains("hello"), "dictionary word 'hello' must appear")
+        XCTAssertTrue(words.contains("help"),  "dictionary word 'help' must appear")
+    }
+
+    func testDictionaryWordCapitalizationVariantsIncluded() throws {
+        let engine = try fixtureEngine()
+        let results = engine.getPrediction(input: "hel")
+        let words = Set(results.map(\.word))
+        XCTAssertTrue(words.contains("Hello"), "first-letter-cap variant of 'hello' must appear")
+        XCTAssertTrue(words.contains("HELLO"), "all-upper variant of 'hello' must appear")
+        XCTAssertTrue(words.contains("Help"),  "first-letter-cap variant of 'help' must appear")
+        XCTAssertTrue(words.contains("HELP"),  "all-upper variant of 'help' must appear")
+    }
+
+    func testMixedCaseDictionaryWordRestored() throws {
+        // "ios" reading → "iOS" word (stored in word trie).
+        let engine = try fixtureEngine()
+        let results = engine.getPrediction(input: "io")
+        let words = Set(results.map(\.word))
+        XCTAssertTrue(words.contains("iOS"), "mixed-case word 'iOS' must be restored from word trie")
+    }
+
+    // MARK: - 4. 同一文字列が重複しない
+
+    func testNoDuplicateWordsInResult() throws {
+        let engine = try fixtureEngine()
+        let results = engine.getPrediction(input: "hel")
+        let wordList = results.map(\.word)
+        XCTAssertEqual(wordList.count, Set(wordList).count,
+                       "every word in the result must be unique (dedup applied)")
+    }
+
+    /// When the input itself collides with a dictionary base word, only one entry
+    /// with the minimum score must survive deduplication.
+    func testDeduplicationWhenInputEqualsDictionaryWord() throws {
+        let engine = try fixtureEngine()
+        let results = engine.getPrediction(input: "hello")
+        let helloCount = results.filter { $0.word == "hello" }.count
+        XCTAssertEqual(helloCount, 1, "'hello' must appear exactly once after deduplication")
+    }
+
+    func testDeduplicationKeepsLowestScore() throws {
+        // "hello" appears as both an input-based candidate (score 500) and a
+        // dictionary base candidate (wordCost 100). After dedup the score must be
+        // the lower of the two (100 from the dictionary).
+        let engine = try fixtureEngine()
+        let results = engine.getPrediction(input: "hello")
+        let helloCandidate = results.first { $0.word == "hello" }
+        XCTAssertNotNil(helloCandidate)
+        XCTAssertEqual(helloCandidate?.score, 100,
+                       "dedup must keep the entry with the lower score (dict cost=100, not input score=500)")
+    }
+
+    // MARK: - 5. score 昇順で並ぶ
+
+    func testResultsSortedByScoreAscending() throws {
+        let engine = try fixtureEngine()
+        let results = engine.getPrediction(input: "hel")
+        let scores = results.map(\.score)
+        XCTAssertEqual(scores, scores.sorted(),
+                       "candidates must be sorted by score ascending (lowest first)")
+    }
+
+    func testFallbackResultsSortedByScore() throws {
+        let engine = try fixtureEngine()
+        let results = engine.getPrediction(input: "zzz")
+        let scores = results.map(\.score)
+        XCTAssertEqual(scores, scores.sorted(),
+                       "fallback candidates must also be sorted by score ascending")
+    }
+
+    // MARK: - 6. predictive がなくても fallback 候補が返る
+
+    func testFallbackReturnedForCompletelyUnknownInput() throws {
+        let engine = try fixtureEngine()
+        let results = engine.getPrediction(input: "zzz")
+        XCTAssertFalse(results.isEmpty,
+                       "unknown prefix must yield fallback candidates, not an empty array")
+        XCTAssertEqual(results.count, 3,
+                       "fallback must contain exactly 3 candidates")
+        let words = Set(results.map(\.word))
+        XCTAssertTrue(words.contains("zzz"), "fallback: original input")
+        XCTAssertTrue(words.contains("Zzz"), "fallback: first-letter-uppercased")
+        XCTAssertTrue(words.contains("ZZZ"), "fallback: all-uppercased")
+    }
+
+    /// When the input already starts with an uppercase letter the first-letter-cap
+    /// fallback variant should receive a *better* (lower) score than the raw input —
+    /// matching Kotlin's `score = if (input.first().isUpperCase()) 8500 else 10001`.
+    func testFallbackCapScoreImprovedWhenInputStartsUppercase() throws {
+        let engine = try fixtureEngine()
+        let results = engine.getPrediction(input: "Zzz")
+        // "Zzz" capitalised is still "Zzz", so the fallback list contains two entries
+        // with word == "Zzz": one at score 10000 (raw input) and one at score 8500
+        // (the first-letter-cap path when input starts uppercase).  After sorting by
+        // score ascending the first occurrence of "Zzz" in results has score 8500.
+        let firstZzz = results.first { $0.word == "Zzz" }
+        XCTAssertNotNil(firstZzz)
+        XCTAssertEqual(firstZzz?.score, 8500,
+                       "when input starts uppercase, the best 'Zzz' entry must have score 8500")
+    }
+
+    func testFallbackForNonAlphabeticInput() throws {
+        // Digits / symbols must not crash capitalizeFirst.
+        let engine = try fixtureEngine()
+        let results = engine.getPrediction(input: "123")
+        XCTAssertEqual(results.count, 3, "numeric input must still produce 3 fallback candidates")
+    }
+
+    // MARK: - 7. Predictive limit enforcement
+
+    /// Input of length ≤ 2 must use a limit of 6 readings.
+    /// Build a dictionary with 8 entries all starting with "a" so the predictive
+    /// search would normally return all 8; with limit=6 only 6 may contribute.
+    func testPredictiveLimitSixForShortInput() throws {
+        let entries: [EnglishDictionaryEntry] = (0..<8).map { i in
+            EnglishDictionaryEntry(reading: "a\(i)", cost: Int16(i * 10), word: "a\(i)")
+        }
+        let engine = try buildEngine(entries: entries)
+        let results = engine.getPrediction(input: "a")   // length 1 → limit 6
+        // Max possible unique words: 6 readings × 3 variants + 3 input variants = 21.
+        // (Some may dedup.) The ceiling must not exceed 21.
+        XCTAssertLessThanOrEqual(results.count, 21,
+                                 "short input (len≤2) must apply a predictive limit of 6 readings")
+        // More practically: ensure we do NOT get all 8 readings' base words.
+        let baseWords = Set(results.map(\.word)).filter { !$0.hasPrefix("a") || $0.count == 1 }
+        // At most 6 "a<N>" readings contributed → at most 6 base forms from the dict.
+        let dictBaseCount = results.filter {
+            $0.score < 500 && $0.word.count == 2 && $0.word.first == "a"
+        }.count
+        XCTAssertLessThanOrEqual(dictBaseCount, 6,
+                                 "no more than 6 dictionary base words when predictive limit is 6")
+    }
+
+    /// Input of length > 2 must use a limit of 12 readings.
+    func testPredictiveLimitTwelveForLongerInput() throws {
+        let entries: [EnglishDictionaryEntry] = (0..<15).map { i in
+            EnglishDictionaryEntry(reading: "hel\(i)", cost: Int16(i * 10), word: "hel\(i)")
+        }
+        let engine = try buildEngine(entries: entries)
+        let results = engine.getPrediction(input: "hel")  // length 3 → limit 12
+        let dictBaseCount = results.filter {
+            $0.score < 500 && $0.word.hasPrefix("hel") && $0.word.count > 3
+        }.count
+        XCTAssertLessThanOrEqual(dictBaseCount, 12,
+                                 "no more than 12 dictionary base words when predictive limit is 12")
+    }
+
+    // MARK: - 8. Uppercase-first input boosts capitalised dictionary variant
+
+    /// When input starts with uppercase the first-letter-cap score for a dict word
+    /// is `max(0, wordCost + len × 2000 − 8000)` — which for short cheap words
+    /// is lower than the plain-lower base score.  This ensures the capitalised
+    /// form sorts ahead of or near the base form.
+    func testUppercaseFirstInputBoostedCapScore() throws {
+        // "nasa" cost=50, len=4 → capScore = max(0, 50 + 4×2000 − 8000) = max(0, 50) = 50
+        // That equals the base score, so after dedup the cap entry ("NASA") may
+        // win or the base entry ("nasa") wins — both at score ≤ 50+4×2000=8050.
+        let engine = try fixtureEngine()
+        let results = engine.getPrediction(input: "Nasa")
+        let scores = results.map(\.score)
+        XCTAssertEqual(scores, scores.sorted(),
+                       "results must still be sorted when input starts uppercase")
+        let words = Set(results.map(\.word))
+        // At least original "Nasa" and all-upper "NASA" must be present.
+        XCTAssertTrue(words.contains("Nasa"), "original mixed-case input must appear")
+        XCTAssertTrue(words.contains("NASA"), "all-upper variant must appear")
     }
 }
